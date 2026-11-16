@@ -8,7 +8,6 @@ import math
 import re
 import secrets
 import time
-from getpass import getpass
 from urllib.parse import urlsplit, parse_qs
 import httpx
 
@@ -114,11 +113,49 @@ async def request_with_retry(client, method, path, **kwargs):
             print(f'请求暂时失败：{type(exc).__name__}，{delay} 秒后重试（{attempt+1}/3）')
             await asyncio.sleep(delay)
 
+def replay_streams(payload):
+    if payload.get('code') != 0:
+        raise ValueError(f"回放详情失败：{payload.get('code')} {payload.get('msg')}")
+    data = payload.get('data') or {}
+    live = [item for item in (data.get('live') or []) if isinstance(item, dict)]
+    streams, seen = [], set()
+    for item in live:
+        ident = str(item.get('id') or '')
+        raw_duration = item.get('duration')
+        if not raw_duration and len(live) == 1:
+            raw_duration = data.get('lessonDuration')
+        duration = float(raw_duration or 0) / 1000
+        if not ident or not math.isfinite(duration) or not 0 < duration < 604800:
+            continue
+        if ident in seen:
+            continue
+        seen.add(ident)
+        streams.append((ident, duration))
+    return streams
+
+def replay_events(uid, cid, classroom, lesson, video, duration):
+    end_ms = int(time.time()*1000)
+    start_ms = end_ms - int(duration*1000) - 1500
+    base = dict(i=20, p='web', t='ykt_playback', u=uid, c=str(cid),
+        classroomid=str(classroom), lob='ykt', v=str(video), fp=0, tp=0, d=0,
+        pg=f'{video}_{secrets.token_hex(4)}', n='ali-cdn.xuetangx.com',
+        lesson_id=str(lesson), source='ks', sp=1)
+    result = []
+    for offset, kind in enumerate(('loadstart', 'loadeddata', 'play', 'playing', 'waiting', 'playing')):
+        result.append(dict(base, et=kind, cp=0, ts=str(start_ms+offset*200), sq=len(result)+1))
+    position = 0.0
+    while position < duration:
+        position = min(duration, position+5)
+        result.append(dict(base, et='heartbeat', cp=round(position, 3),
+            ts=str(start_ms+1400+int(position*1000)), sq=len(result)+1))
+    return result
+
 async def run():
+    print('凭据输入可见；不要分享包含输入内容的截图。')
     raw = input('课堂或课件网址（自动遍历整门课）：').strip()
     host, classroom, cards = parse_url(raw)
-    session = getpass('sessionid（隐藏）：').strip()
-    csrf = getpass('csrftoken（隐藏）：').strip()
+    session = input('sessionid（可见）：').strip()
+    csrf = input('csrftoken（可见）：').strip()
     xtbz = input('xtbz [ykt]：').strip() or 'ykt'
     if not session or not csrf:
         raise ValueError('凭据不能为空')
@@ -151,6 +188,9 @@ async def run():
             client.headers['University-Id'] = str(university)
             client.cookies.set('university_id', str(university))
             client.cookies.set('uv_id', str(university))
+        activity_types = {}
+        replay_submitted = 0
+        replay_failed = 0
         entries = []
         seen = set()
         if cards:
@@ -176,6 +216,8 @@ async def run():
                 if ident is None:
                     continue
                 ident = str(ident)
+                if ident.isdigit():
+                    activity_types[ident] = str(activity.get('type', ''))
                 if ident.isdigit() and ident not in seen:
                     entries.append((ident, activity.get('title') or f'活动 {ident}'))
                     seen.add(ident)
@@ -191,6 +233,35 @@ async def run():
         unsupported = 0
         for index, (cards, title) in enumerate(entries, 1):
             print(f'\n[{index}/{len(entries)}] {title}，课件编号 {cards}')
+            if activity_types.get(cards) == '14':
+                try:
+                    referer = f'https://{host}/v2/web/v3/playback/{cards}/slide/2/0'
+                    summary = await get('/api/v3/lesson-summary/replay',
+                        params={'lesson_id':cards}, headers={'Referer':referer})
+                    streams = replay_streams(summary)
+                    if not streams:
+                        replay_failed += 1
+                        print('回放未提供有效视频编号和时长，未提交。')
+                        continue
+                    for replay_id, replay_duration in streams:
+                        events = replay_events(uid, cid, classroom, cards, replay_id, replay_duration)
+                        print(f'直播回放 {replay_id}，时长 {replay_duration:.1f} 秒')
+                        previous_position = 0.0
+                        for seq, packet in enumerate(events, 1):
+                            delay = max(0, packet['cp']-previous_position)
+                            if delay:
+                                await asyncio.sleep(delay)
+                            packet['ts'] = str(int(time.time()*1000))
+                            await send([packet])
+                            previous_position = packet['cp']
+                            if seq % 12 == 0:
+                                print(f"回放已提交位置 {packet['cp']:.1f}/{replay_duration:.1f} 秒（未确认完成）")
+                        replay_submitted += 1
+                        print('回放事件已提交；尚无已验证的回放进度查询接口，不计入确认完成，请在网页核对。')
+                except (ValueError, httpx.HTTPError) as exc:
+                    replay_failed += 1
+                    print(f'回放未处理：{type(exc).__name__}：{exc}')
+                continue
             try:
                 payload = await get(f'/v2/api/web/cards/detlist/{cards}', params={'classroom_id':classroom})
             except httpx.HTTPStatusError as exc:
@@ -206,7 +277,7 @@ async def run():
             videos = videos_in(payload.get('data', {}))
             if not videos:
                 unsupported += 1
-                print('该活动未识别到内嵌视频；普通阅读、作业和直播不在本版本处理范围。')
+                print('该活动未识别到内嵌视频；本活动没有内嵌视频；普通阅读和作业尚未适配。')
                 continue
             video_count += len(videos)
             print(f'识别到 {len(videos)} 个视频；Ctrl+C 停止，重启会查询已保存的进度。')
@@ -265,6 +336,8 @@ async def run():
                     print(f"服务端未确认完成：{v['title']}，进度 {float(final.get('rate') or 0):.0%}；不自动重复提交。")
 
         print(f'整课遍历结束：识别 {video_count} 个内嵌视频；未确认完成 {unfinished} 个；未支持或未读取活动 {unsupported} 个。普通阅读未处理。')
+
+        print(f'直播回放：已提交但待网页核对 {replay_submitted} 个；未处理或失败 {replay_failed} 个。普通阅读未提交。')
 
 if __name__ == '__main__':
     try:
